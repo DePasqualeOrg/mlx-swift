@@ -1,8 +1,16 @@
-// swift-tools-version: 5.12
-// The swift-tools-version declares the minimum version of Swift required to build this package.
+// swift-tools-version: 6.0
 // Copyright © 2024 Apple Inc.
 
 import PackageDescription
+
+// External Cmlx mode (Linux): when MLX_SWIFT_USE_EXTERNAL_CMLX=1, the Cmlx target
+// links prebuilt static archives from MLX_SWIFT_EXTERNAL_CMLX_PREFIX (default
+// /opt/mlx-swift) instead of compiling C++. This is how CUDA is consumed — build
+// mlx via its own CMakeLists.txt with -DMLX_BUILD_CUDA=ON, then link the result.
+let useExternalCmlx =
+    Context.environment["MLX_SWIFT_USE_EXTERNAL_CMLX"] == "1"
+let externalCmlxPrefix =
+    Context.environment["MLX_SWIFT_EXTERNAL_CMLX_PREFIX"] ?? "/opt/mlx-swift"
 
 #if os(Linux)
     let platformExcludes: [String] = [
@@ -65,12 +73,13 @@ import PackageDescription
         .linkedLibrary("openblas", .when(platforms: [.linux])),
     ]
 
-    let mlxSwiftExcludes: [String] = [
-        "GPU+Metal.swift",
-        "MLXArray+Metal.swift",
-        "MLXFast.swift",
-        "MLXFastKernel.swift",
-    ]
+    // MLXFast.swift / MLXFastKernel.swift call mlx_fast_* C symbols. libmlxc
+    // provides them on the external-Cmlx path; the source-build path excludes
+    // mlx-c/mlx/c/fast.cpp above, so gate the Swift files to match.
+    // TODO: verify mlx_fast_metal_kernel_* runtime behavior on CUDA.
+    let mlxSwiftExcludes: [String] =
+        ["GPU+Metal.swift", "MLXArray+Metal.swift"]
+        + (useExternalCmlx ? [] : ["MLXFast.swift", "MLXFastKernel.swift"])
 #else
     let platformExcludes: [String] = [
         "mlx/mlx/backend/cpu/compiled.cpp",
@@ -104,7 +113,42 @@ import PackageDescription
     let mlxSwiftExcludes: [String] = []
 #endif
 
-let cmlx = Target.target(
+// CUDA + cuDNN libs cmlxExternal links. cuDNN 9 split monolithic libcudnn into
+// component libraries, and mlx's static archives don't carry transitive deps,
+// so list them explicitly.
+let cudaLinkedLibraries = [
+    "cudart", "cublasLt", "nvrtc", "nvJitLink", "cuda",
+    "cudnn", "cudnn_graph", "cudnn_engines_runtime_compiled",
+    "cudnn_engines_precompiled", "cudnn_heuristic", "cudnn_ops",
+    "cudnn_cnn", "cudnn_adv",
+    "nccl", "openblas", "gfortran", "stdc++", "dl", "m", "pthread",
+]
+
+// Compiles a single empty stub so SwiftPM has a source to build; real
+// symbols come from the prebuilt static archives at externalCmlxPrefix.
+let cmlxExternal = Target.target(
+    name: "Cmlx",
+    path: "Source/Cmlx",
+    sources: ["CmlxExternal/stub.cpp"],
+    publicHeadersPath: "include",
+    linkerSettings: [
+        .unsafeFlags(
+            [
+                "-L\(externalCmlxPrefix)/lib",
+                "-L/usr/local/cuda/lib64",
+                "-L/usr/local/cuda/lib64/stubs",
+                "-Xlinker", "-rpath", "-Xlinker", "\(externalCmlxPrefix)/lib",
+                "-Xlinker", "-rpath", "-Xlinker", "/usr/local/cuda/lib64",
+                // Group the static archives so the linker resolves
+                // cross-archive symbols regardless of order.
+                "-Xlinker", "--start-group",
+                "-lmlxc", "-lmlx", "-lgguflib",
+                "-Xlinker", "--end-group",
+            ], .when(platforms: [.linux])),
+    ] + cudaLinkedLibraries.map { .linkedLibrary($0, .when(platforms: [.linux])) }
+)
+
+let cmlxFromSource = Target.target(
     name: "Cmlx",
     path: "Source/Cmlx",
     exclude: platformExcludes + [
@@ -214,11 +258,13 @@ let cmlx = Target.target(
     linkerSettings: linkerSettings
 )
 
+let cmlx = useExternalCmlx ? cmlxExternal : cmlxFromSource
+
 let package = Package(
     name: "mlx-swift",
 
     platforms: [
-        .macOS("14.0"),
+        .macOS(.v14),
         .iOS(.v17),
         .tvOS(.v17),
         .visionOS(.v1),
@@ -232,7 +278,6 @@ let package = Package(
         .library(name: "MLXOptimizers", targets: ["MLXOptimizers"]),
         .library(name: "MLXFFT", targets: ["MLXFFT"]),
         .library(name: "MLXLinalg", targets: ["MLXLinalg"]),
-        .library(name: "MLXFast", targets: ["MLXFast"]),
     ],
     dependencies: [
         // for Complex type
@@ -251,52 +296,27 @@ let package = Package(
                 "Cmlx",
                 .product(name: "Numerics", package: "swift-numerics"),
             ],
-            exclude: mlxSwiftExcludes,
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency")
-            ]
+            exclude: mlxSwiftExcludes
         ),
         .target(
             name: "MLXRandom",
-            dependencies: ["MLX"],
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency")
-            ]
-        ),
-        .target(
-            name: "MLXFast",
-            dependencies: ["MLX", "Cmlx"],
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency")
-            ]
+            dependencies: ["MLX"]
         ),
         .target(
             name: "MLXNN",
-            dependencies: ["MLX"],
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency")
-            ]
+            dependencies: ["MLX"]
         ),
         .target(
             name: "MLXOptimizers",
-            dependencies: ["MLX", "MLXNN"],
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency")
-            ]
+            dependencies: ["MLX", "MLXNN"]
         ),
         .target(
             name: "MLXFFT",
-            dependencies: ["MLX"],
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency")
-            ]
+            dependencies: ["MLX"]
         ),
         .target(
             name: "MLXLinalg",
-            dependencies: ["MLX"],
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency")
-            ]
+            dependencies: ["MLX"]
         ),
 
         .testTarget(
@@ -334,6 +354,7 @@ let package = Package(
             sources: ["CustomFunctionExampleSimple.swift"]
         ),
     ],
+    swiftLanguageModes: [.v6],
     cxxLanguageStandard: .gnucxx20
 )
 

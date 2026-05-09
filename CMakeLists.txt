@@ -114,3 +114,12 @@ if(MLX_BUILD_EXAMPLES)
   target_link_libraries(tutorial PRIVATE MLX)
   target_compile_options(tutorial PRIVATE -parse-as-library)
 endif()
+
+# Install rules — used by the SwiftPM "external Cmlx" mode to consume the
+# CMake-built MLX libraries from a known prefix. Only installs the static
+# archives downstream SwiftPM consumers need to link against (libmlx and
+# libmlxc come from the underlying MLX install rules; libgguflib does not,
+# so install it explicitly here).
+if(TARGET gguflib)
+  install(TARGETS gguflib DESTINATION lib)
+endif()
